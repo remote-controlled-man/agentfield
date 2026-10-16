@@ -6,6 +6,660 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) 
 
 <!-- changelog:entries -->
 
+## [0.1.142-rc.12] - 2026-10-15
+
+
+### Fixed
+
+- Fix(control-plane): write the executions row for legacy reasoner and skill calls (#1099)
+
+* fix(control-plane): write the executions row for legacy reasoner and skill calls
+
+ExecuteReasonerHandler and ExecuteSkillHandler (POST /reasoners/:id and
+/skills/:id) sent X-Execution-ID to the agent but never created the
+executions row, so the agent's POST /api/v1/executions/:id/status
+callback hit UpdateExecutionRecord with no row and got a 404.
+
+Both handlers now create the row (status running) right after the input
+is marshalled, before the serverless branch and before dispatch. The
+shape matches the normal execute path in execute_prepare.go. A failed
+insert is logged and the call continues, so the legacy endpoints gain
+no new failure mode.
+
+persistWorkflowExecution, which every terminal exit of both handlers
+already calls, now also copies status, error, result, completed_at and
+duration onto the executions row. A row the agent's own callback has
+already made terminal is left untouched.
+
+Tests: two handler tests check the row exists while the agent is being
+called and ends as succeeded. A third test runs the legacy reasoner
+endpoint and the real status callback handler on LocalStorage; the stub
+agent posts a failed status callback during dispatch. It gets a 404 on
+main and a 200 here, and the agent's failed status is kept. A fourth
+test makes the insert fail and checks the call still returns 200.
+
+Test storages: reasonerHandlerStorage gains GetExecutionRecord and
+UpdateExecutionRecord passthroughs; reasonerTestStorage and
+persistWorkflowExecutionStore gain the record methods the handlers now
+call, so they do not hit the nil embedded interface.
+
+Fixes #1086
+
+$ cd control-plane && go test -tags sqlite_fts5 ./internal/handlers/ \
+    -run 'CreatesExecutionRowBeforeDispatch|AgentStatusCallbackFindsExecution' -v
+
+On main (tests only):
+--- FAIL: TestExecuteReasonerHandler_CreatesExecutionRowBeforeDispatch
+    Messages: executions row must exist while the agent is being called
+--- FAIL: TestExecuteSkillHandler_CreatesExecutionRowBeforeDispatch
+    Messages: executions row must exist while the agent is being called
+--- FAIL: TestExecuteReasonerHandler_AgentStatusCallbackFindsExecution
+    expected: 200, actual: 404
+
+With the fix: all 3 PASS.
+
+$ go test -tags sqlite_fts5 ./internal/handlers/... ./internal/storage/...
+2547 passed, 0 failed, 39 skipped (6 packages ok)
+$ go vet -tags sqlite_fts5 ./internal/handlers/ ./internal/storage/   clean
+$ golangci-lint run --new-from-rev=upstream/main ./internal/handlers/  0 issues
+
+* fix(control-plane): keep 202 acknowledgements running and finalize cancelled legacy calls
+
+Addresses review on #1099.
+
+202 acknowledgements. The Python and Go SDKs answer an async execution
+with HTTP 202 and status "processing" while the reasoner keeps running.
+The legacy reasoner and skill handlers treated that as success, and the
+finalizer then wrote "succeeded" with the acknowledgement as the result.
+A later failed callback got 409, a later successful one was a no-op that
+kept the acknowledgement, and a late failed workflow event could not
+repair the row.
+
+On a 202 both handlers now persist the workflow row as running and leave
+the executions row running, so the agent's status callback or workflow
+event completes the execution. If the callback landed before the 202
+came back, it found no workflow row to update; the acknowledgement then
+copies the terminal outcome from the executions row instead of leaving
+the workflow row running. The response to the legacy caller is
+unchanged.
+
+Cancelled requests. persistWorkflowExecution and the finalizer reused
+the request context, so a caller cancelling after dispatch made the
+dispatch fail and the final writes fail with it, leaving the row running
+with no completion time. Final persistence now runs on
+context.WithoutCancel(ctx) bounded by a 5 s timeout. The terminal-state
+guard in the finalizer is kept.
+
+Tests (real LocalStorage):
+- TestLegacyExecute_CallbackAfterAsyncAcknowledgement
+  {reasoner,skill}/{succeeded,failed}
+- TestLegacyExecute_CallbackBeforeAsyncAcknowledgement
+- TestLegacyExecute_FailedWorkflowEventAfterAsyncAcknowledgement
+- TestLegacyExecute_CancelledRequestFinalizesExecution/{reasoner,skill}
+
+$ cd control-plane && go test -tags sqlite_fts5 ./internal/handlers/ -run 'TestLegacyExecute_' -v
+
+On 61e498fb (tests only):
+--- FAIL: TestLegacyExecute_CallbackAfterAsyncAcknowledgement (4/4 subtests)
+    expected: "running", actual: "succeeded"
+    Messages: a 202 acknowledgement is not the result
+--- FAIL: TestLegacyExecute_CallbackBeforeAsyncAcknowledgement
+    workflow output is {"status":"processing",...}, not {"answer":42}
+--- FAIL: TestLegacyExecute_FailedWorkflowEventAfterAsyncAcknowledgement
+    expected: "failed", actual: "succeeded"
+--- FAIL: TestLegacyExecute_CancelledRequestFinalizesExecution (2/2 subtests)
+    expected: "failed", actual: "running"
+
+With the fix: all PASS (also -count=5).
+
+$ go test -tags sqlite_fts5 ./internal/handlers/... ./internal/storage/... ./internal/server/...
+10 packages ok, 0 failed
+$ go vet -tags sqlite_fts5 ./internal/handlers/... ./internal/storage/...   clean
+
+---------
+
+Co-authored-by: ZeroPoint95 <329227198+ZeroPoint95@users.noreply.github.com> (ef72128)
+
+## [0.1.142-rc.11] - 2026-10-15
+
+
+### Added
+
+- Feat(sdk/go/ai): support IO Intelligence (io.net) provider (#1102)
+
+* feat(sdk/go/ai): support IO Intelligence (io.net) provider
+
+Mirror the Infron gateway support (#874) for IO Intelligence, io.net's
+OpenAI-compatible Chat Completions endpoint:
+
+- DefaultConfig picks up IONET_API_KEY when no provider key with higher
+  precedence is set, pointing at
+  https://api.intelligence.io.solutions/api/v1 (OPENAI, INFRON and
+  OPENROUTER keys all keep precedence, so adding IONET_API_KEY never
+  silently reroutes an existing deployment).
+- IsIonet() detects the endpoint by base URL or an ionet/ model prefix.
+- The ionet/ model prefix is a routing marker only and is stripped
+  before the request goes out: the endpoint serves bare Hugging
+  Face-style org/name ids (e.g.
+  meta-llama/Llama-3.3-70B-Instruct).
+- No usage opt-in or attribution headers: io.net reports usage in the
+  standard Chat Completions shape.
+- Documented in docs/ENVIRONMENT_VARIABLES.md and the Go SDK README,
+  next to the Infron sections.
+
+go test ./ai/... passes; the new suite covers env pickup and
+precedence, IsIonet, prefix stripping on the wire, no usage opt-in,
+and max_tokens preservation.
+
+* fix(sdk/go/ai): default to an io.net model when the io.net key is selected
+
+* fix(sdk/go/ai): decide the io.net default model with the same detection as the request path
+
+* docs(sdk/go/ai): state that the ionet/ marker never reroutes a request
+
+* docs(sdk/go/ai): refresh the APIKey doc comment and note catalog rotation
+
+* test(sdk/go/ai): isolate the config-error and ionet tests from ambient keys
+
+The config-validation subtest cleared the OpenAI, OpenRouter, base-URL and
+model variables but not the Infron and io.net keys, so an exported io.net key
+turned it into a live request against the real endpoint. Clear all six
+selection variables in the subtest, move the ionet env handling to t.Setenv
+like the rest of the package, and add a tools/tool_choice passthrough case
+for the ionet/ model marker.
+
+---------
+
+Co-authored-by: ZeroPoint95 <329227198+ZeroPoint95@users.noreply.github.com> (0e134b1)
+
+## [0.1.142-rc.10] - 2026-10-14
+
+
+### Fixed
+
+- Fix(sdk/python): let AsyncConfig env flags fall back to the class default (#1100)
+
+The two boolean parsers added in #1082 each bake in a polarity: _env_flag_default_on
+returns True for anything outside the falsey vocabulary and _env_flag_default_off
+returns False for anything outside the truthy one. That is correct for AsyncConfig's
+own field defaults, but it makes the fallback independent of the class -- a subclass
+that changes a default gets the parser's answer for an unrecognised string instead of
+its own:
+
+    @dataclass
+    class CachingOff(AsyncConfig):
+        enable_result_caching: bool = False
+
+    # AGENTFIELD_ASYNC_ENABLE_RESULT_CACHING=maybe
+    CachingOff.from_environment().enable_result_caching   # True, should be False
+
+Add one polarity-free parser, _env_flag, that raises ValueError outside the
+vocabulary, and use it for all five flags. get_env_var already catches
+(ValueError, TypeError) and returns the default_value it was handed, which
+from_environment() passes as config.<field> -- so the fallback now comes from the
+class, exactly as the float and int converters in the same function already do.
+
+This is the second half of #1089; the remaining strict parsers in logger.py,
+agent.py and agent_server.py are handled separately in #1090.
+
+It also matches the Go control plane, which has always parsed this way:
+config.applyBoolEnv leaves *target untouched and logs a warning when
+strconv.ParseBool rejects the string, and the handler tests pin parseBool(" YeS ")
+-> true, parseBool("0") -> false, parseBool("maybe") -> error.
+
+_env_flag_default_on and _env_flag_default_off are kept, now expressed in terms of
+_env_flag, for call sites that know their default statically -- #1090 imports
+_env_flag_default_off into logger.py for the default-off AGENTFIELD_LOG_* flags, so
+removing them would break an open PR. A test pins both wrappers' contract.
+
+AsyncConfig's own observable behaviour is unchanged: with no AGENTFIELD_ASYNC_*
+variable set the converters are never reached, and digesting every field of
+from_environment() on both trees gives the same SHA-256
+(5960894a0c0bd6c817a09800eee26998e09625f7dfb23cd3d75ce1ee9088eb90). For a set
+variable, every value in the vocabulary parses as before and every value outside it
+still yields the field default -- the default just now comes from the class.
+
+Fixes the AsyncConfig half of #1089. (88a5f73)
+
+## [0.1.142-rc.9] - 2026-10-05
+
+
+### Other
+
+- Telemetry updates (752cc57)
+
+## [0.1.142-rc.8] - 2026-10-03
+
+
+### Testing
+
+- Test(sdk): verify Windows batch probe end-to-end and harden cmd.exe branch
+
+Batch probe hardening (split call sites, quote/control-char guard, corrected parsing comment) plus real Windows E2E verification of the env-template probe. Spark suite 1029 passed via SSH; windows-latest harness-doctor job passed.
+
+Assisted-by: CodeAF (mimo-v2.6-pro)
+
+Co-Authored-By: CodeAF <267109073+agentfield-bot@users.noreply.github.com> (d6f19d4)
+
+## [0.1.142-rc.7] - 2026-10-01
+
+
+### Chores
+
+- Chore(deps): bump the uv group across 1 directory with 2 updates (#1085)
+
+Bumps the uv group with 2 updates in the /sdk/python directory: [litellm](https://github.com/BerriAI/litellm) and [urllib3](https://github.com/urllib3/urllib3).
+
+
+Updates `litellm` from 1.87.0 to 1.88.6
+- [Release notes](https://github.com/BerriAI/litellm/releases)
+- [Commits](https://github.com/BerriAI/litellm/compare/v1.87.0...v1.88.6)
+
+Updates `urllib3` from 2.7.0 to 2.8.0
+- [Release notes](https://github.com/urllib3/urllib3/releases)
+- [Changelog](https://github.com/urllib3/urllib3/blob/main/CHANGES.rst)
+- [Commits](https://github.com/urllib3/urllib3/compare/2.7.0...2.8.0)
+
+---
+updated-dependencies:
+- dependency-name: litellm
+  dependency-version: 1.88.6
+  dependency-type: direct:production
+  dependency-group: uv
+- dependency-name: urllib3
+  dependency-version: 2.8.0
+  dependency-type: indirect
+  dependency-group: uv
+...
+
+Signed-off-by: dependabot[bot] <support@github.com>
+Co-authored-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com> (c41e4a5)
+
+## [0.1.142-rc.6] - 2026-10-01
+
+
+### Fixed
+
+- Fix(events): cache non-duplicate status events so A→B→A flips are not dropped (#1079) (5df7496)
+
+## [0.1.142-rc.5] - 2026-10-01
+
+
+### Chores
+
+- Chore(deps): bump the npm_and_yarn group across 2 directories with 2 updates (#1084)
+
+Bumps the npm_and_yarn group with 1 update in the /desktop directory: [electron](https://github.com/electron/electron).
+Bumps the npm_and_yarn group with 1 update in the /sdk/typescript directory: [axios](https://github.com/axios/axios).
+
+
+Updates `electron` from 42.9.1 to 42.10.0
+- [Release notes](https://github.com/electron/electron/releases)
+- [Commits](https://github.com/electron/electron/compare/v42.9.1...v42.10.0)
+
+Updates `axios` from 1.18.0 to 1.20.0
+- [Release notes](https://github.com/axios/axios/releases)
+- [Changelog](https://github.com/axios/axios/blob/v1.x/CHANGELOG.md)
+- [Commits](https://github.com/axios/axios/compare/v1.18.0...v1.20.0)
+
+---
+updated-dependencies:
+- dependency-name: electron
+  dependency-version: 42.10.0
+  dependency-type: direct:development
+  dependency-group: npm_and_yarn
+- dependency-name: axios
+  dependency-version: 1.20.0
+  dependency-type: direct:production
+  dependency-group: npm_and_yarn
+...
+
+Signed-off-by: dependabot[bot] <support@github.com>
+Co-authored-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com> (484bddf)
+
+## [0.1.142-rc.4] - 2026-10-01
+
+
+### Fixed
+
+- Fix(sdk/go): stop retrying execution status callbacks on non-retryable 4xx (#1081) (4a87b1c)
+
+## [0.1.142-rc.3] - 2026-10-01
+
+
+### Fixed
+
+- Fix(control-plane): return 404 for status callbacks on unknown executions (#1080) (e447e0b)
+
+- Fix(sdk/python): parse AGENTFIELD_ASYNC boolean flags with the repo's env vocabulary (#1082)
+
+AsyncConfig.from_environment() read all five boolean feature flags with
+`lambda x: x.lower() == "true"`. Four of those fields default to True, so the
+only values that could be expressed were "true" and "false": setting
+AGENTFIELD_ASYNC_ENABLE_RESULT_CACHING=1 -- or =yes, or =on -- evaluated to
+False and silently disabled result caching, the opposite of what the value says.
+The same inversion applied to enable_async_execution, enable_batch_polling and
+fallback_to_sync, and it reaches users by default because both Agent (agent.py:846)
+and AgentFieldClient (client.py:182) build their async_config from
+from_environment() when none is passed.
+
+The lambda also never raises, so get_env_var's `except (ValueError, TypeError):
+return default_value` fallback is unreachable for booleans and an unparseable
+value overrides the field with False instead of leaving the default. PR #714,
+which wired this into the client default, documents the intended contract:
+from_environment() "only overrides fields when the corresponding env var is set
+(falling back to the default on unparseable values)".
+
+Use the vocabulary the package already uses, split by the field's default:
+default-on flags opt out with ("0", "false", "no", "off") like
+log_writer._queue_enabled, logger._stdout_mirror_enabled, node_logs.logs_enabled
+and openrouter_attribution.attribution_enabled; the default-off enable_event_stream
+opts in with ("1", "true", "yes", "on") like litellm_observability._TRUE_VALUES.
+A value outside the vocabulary now leaves the field at its default, which is what
+makes the documented fallback hold without the converter having to raise.
+
+With no AGENTFIELD_ASYNC_* variable set the converters are never reached --
+get_env_var returns the default before consulting them -- so from_environment()
+produces a byte-identical AsyncConfig to before (verified by digesting every
+field on both trees). Only explicit opt-in/opt-out values change behaviour, and
+every value that already worked still does: "true"/"false"/"0" are unchanged,
+while "1"/"yes"/"on"/whitespace-padded values now mean what they say.
+
+logger.py's three AGENTFIELD_LOG_* flags use the same `== "true"` shape but all
+default to False, so they fail in the less harmful direction; left alone here to
+keep this to one seam. (e960677)
+
+## [0.1.142-rc.2] - 2026-10-01
+
+
+### Fixed
+
+- Fix(sdk/python): keep rate limiter jitter off the global random state (#1078)
+
+_calculate_backoff_delay called random.seed(self._container_seed + attempt)
+before drawing jitter, which reseeds the module-level generator shared by the
+whole host process. Every rate-limit retry therefore reset the application's
+random stream to a value derived from HOSTNAME and the pid, so all later
+random.random()/choice()/shuffle()/sample() calls in the process returned a
+repeatable sequence instead of continuing the stream the caller seeded.
+
+It also degraded the SDK's own jitter: rate_limiter.py is the only module that
+seeds the global generator, but client.py:1295 (_next_poll_interval) and
+harness/_runner.py:415 and :423 (transient-error backoff) draw from it, so one
+rate-limited LLM call made their poll intervals and backoff delays a
+deterministic function of the container seed -- identical across containers
+that share a hostname/pid shape, which is exactly the synchronisation jitter
+exists to prevent.
+
+Draw from a private random.Random instance instead. The returned jitter is
+bit-identical (verified across 240 seed/attempt/range combinations by
+comparing float.hex()), because CPython's module-level random.uniform
+delegates to a module-level Random seeded through the same path. Backoff
+timing, retry counts, and per-container jitter distribution are unchanged;
+the seed just stops leaking into global state, which also stops concurrent
+callers from drawing jitter off a seed another caller installed.
+
+This matches what the Go and TypeScript SDKs already do: sdk/go/ai/
+rate_limiter.go:321 uses rand.New(rand.NewSource(containerSeed + attempt)) and
+sdk/typescript/src/ai/RateLimiter.ts:172 uses a local _createJitterRng closure,
+both with the same seeding scheme and the same (u*2-1)*r formula that
+random.uniform(-r, r) expands to.
+
+The existing test_calculate_backoff_applies_jitter_and_max_cap already computes
+its expectation with random.Random(container_seed + attempt) and compares only
+the returned number, which is why this survived: nothing asserted on the global
+state. Adds two tests pinning the contract at both the helper and the public
+execute_with_retry path.
+
+enable_rate_limit_retry defaults to True (types.py:497) and agent_ai.py:605-609
+re-forces it, so the affected path is the default one. (b675e2d)
+
+## [0.1.142-rc.1] - 2026-10-01
+
+
+### Chores
+
+- Chore(deps): bump pyjwt (#1083)
+
+Bumps the uv group with 1 update in the /sdk/python directory: [pyjwt](https://github.com/jpadilla/pyjwt).
+
+
+Updates `pyjwt` from 2.13.0 to 2.15.0
+- [Release notes](https://github.com/jpadilla/pyjwt/releases)
+- [Changelog](https://github.com/jpadilla/pyjwt/blob/master/CHANGELOG.rst)
+- [Commits](https://github.com/jpadilla/pyjwt/compare/2.13.0...2.15.0)
+
+---
+updated-dependencies:
+- dependency-name: pyjwt
+  dependency-version: 2.15.0
+  dependency-type: indirect
+  dependency-group: uv
+...
+
+Signed-off-by: dependabot[bot] <support@github.com>
+Co-authored-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com> (88ae7ca)
+
+- Chore(deps): bump ip-address (#1077)
+
+Bumps the npm_and_yarn group with 1 update in the /examples/benchmarks/100k-scale/mastra-bench directory: [ip-address](https://github.com/beaugunderson/ip-address).
+
+
+Updates `ip-address` from 10.4.0 to 10.7.2
+- [Release notes](https://github.com/beaugunderson/ip-address/releases)
+- [Commits](https://github.com/beaugunderson/ip-address/compare/v10.4.0...v10.7.2)
+
+---
+updated-dependencies:
+- dependency-name: ip-address
+  dependency-version: 10.7.2
+  dependency-type: indirect
+  dependency-group: npm_and_yarn
+...
+
+Signed-off-by: dependabot[bot] <support@github.com>
+Co-authored-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com> (c5750ee)
+
+## [0.1.141] - 2026-09-29
+
+## [0.1.141-rc.7] - 2026-09-29
+
+
+### Fixed
+
+- Fix(sdk): probe harness binaries as argv, not a cmd.exe command string (#1075)
+
+* fix(sdk): probe harness binaries as argv, not cmd.exe /c
+
+CodeQL alerts 60, 61, and 62 flag defaultVersionProbe for building a
+cmd.exe /c command line from a resolved binary path. Pass that path as
+an execFile argv element instead. PATHEXT resolution is unchanged.
+
+Assisted-by: CodeAF (grok-4.7)
+Co-Authored-By: CodeAF <267109073+agentfield-bot@users.noreply.github.com>
+
+* fix(sdk): run Windows batch probes as separate cmd.exe argv
+
+Node rejects execFile of a .cmd or .bat (CVE-2024-27980). Keep cmd.exe
+as the interpreter for those shims only, and pass /d, /s, /c, the
+resolved path, and the version args as separate argv elements.
+
+Assisted-by: CodeAF (grok-4.7)
+Co-Authored-By: CodeAF <267109073+agentfield-bot@users.noreply.github.com>
+
+* fix(sdk): drop cmd /s from the Windows batch version probe
+
+Node quotes an argv element that contains spaces. cmd /s then strips the
+outer quotes of the whole line and splits C:\Program Files\.... Pass
+/d /c and the resolved path as separate argv elements, with no /s and
+no joined command string.
+
+Assisted-by: CodeAF (grok-4.7)
+Co-Authored-By: CodeAF <267109073+agentfield-bot@users.noreply.github.com>
+
+* fix(sdk): pass Windows batch probe paths through the child env
+
+The argv form (cmd.exe /d /c <path> --version, no /s) let cmd.exe
+re-parse the path: a directory named `x) & echo PWNED (y` ran the
+injected command, and `&`, `^`, `;,=` paths failed the probe. The
+original /s form was safe from injection but expanded %VAR% in paths.
+
+The /c line is now a fixed template of quoted %AGENTFIELD_PROBE_ARG_N%
+references, with the path and args set in the child's environment.
+cmd.exe expands each variable once after splitting the line, so every
+metacharacter stays literal, and no path data reaches the command
+string that CodeQL tracks. /v:off keeps `!` literal.
+
+Verified on real cmd.exe (Windows 11, Node 22) across 10 hostile shim
+directories: all return the version, none injects.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+---------
+
+Co-authored-by: CodeAF <267109073+agentfield-bot@users.noreply.github.com>
+Co-authored-by: Abir Abbas <abirabbas1998@gmail.com>
+Co-authored-by: Claude Opus 5.5 (1M context) <noreply@anthropic.com> (bf11859)
+
+## [0.1.141-rc.6] - 2026-09-29
+
+
+### Chores
+
+- Chore(deps): bump ip-address (#1076)
+
+Bumps the npm_and_yarn group with 1 update in the /sdk/typescript directory: [ip-address](https://github.com/beaugunderson/ip-address).
+
+
+Updates `ip-address` from 10.4.0 to 10.7.2
+- [Release notes](https://github.com/beaugunderson/ip-address/releases)
+- [Commits](https://github.com/beaugunderson/ip-address/compare/v10.4.0...v10.7.2)
+
+---
+updated-dependencies:
+- dependency-name: ip-address
+  dependency-version: 10.7.2
+  dependency-type: indirect
+  dependency-group: npm_and_yarn
+...
+
+Signed-off-by: dependabot[bot] <support@github.com>
+Co-authored-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com> (5be6276)
+
+## [0.1.141-rc.5] - 2026-09-26
+
+
+### Testing
+
+- Test(go): cover explicit harness provider factory paths (#1073)
+
+* test(go): cover explicit harness provider factory paths
+
+* test(go): use expected provider type in factory table (13b4460)
+
+## [0.1.141-rc.4] - 2026-09-26
+
+
+### Added
+
+- Feat(go-sdk): add harness doctor preflight and provider availability specs (#1074)
+
+Closes the Go SDK half of #685. Python (harness/_doctor.py) and
+TypeScript (harness/availability.ts) both ship harness_doctor with a
+ProviderHealth report; Go had nothing, even though the issue notes Go is
+subprocess-only so doctor and errors matter most there.
+
+- harness/availability.go: ProviderSpec table for all eight Go providers
+  (binary, version args, install command, auth env vars), mirroring the
+  Python and TypeScript spec data. Adds ProviderUnavailableError, which
+  names the exact install command and any unset auth variables, plus the
+  ErrProviderUnavailable sentinel for errors.Is and ensureCLIAvailable
+  for PATH resolution.
+- harness/doctor.go: Doctor(ctx, DoctorOptions) returning ProviderHealth
+  per provider (installed / version / auth / usable / issues), with field
+  names and issue codes matching the other two SDKs. Static PATH and env
+  checks by default; DoctorOptions.Probe opts into running each
+  provider's version command, following the issue's 'lean static by
+  default, probe behind a flag' guidance. Unusable() filters to the
+  providers that block, so callers can exit non-zero on exactly those.
+- agent/harness.go: Agent.HarnessDoctor(ctx, providers...) for parity
+  with app.harness_doctor() and agent.harnessDoctor().
+
+Two deliberate divergences from Python/TS, documented in the spec table:
+claude-code is a binary spec here because the Go provider shells out to
+the claude CLI rather than importing a language wrapper, and cursor is
+Go-only today (binary 'agent').
+
+Doctor takes injectable LookPath and VersionProbe hooks so tests never
+depend on which CLIs happen to be installed; the suite is fully
+platform-independent. Coverage on the new files: most functions 100%,
+Doctor 94.9%.
+
+Scoped to the library API. The 'af harness doctor' CLI subcommand lives
+in the control-plane module and is left as follow-up. (cbc9e37)
+
+## [0.1.141-rc.3] - 2026-09-25
+
+
+### Fixed
+
+- Fix(sdk/python): skip schema output dir for schema-free harness runs (#1072)
+
+HarnessRunner.run() allocated the per-run .agentfield-out-* directory
+before dispatching the provider even when schema is None. That directory
+only ever holds .agentfield_output.json (#684, #891), and every consumer
+of it is already inside an `if schema is not None` guard, so a text-only
+run paid a filesystem write it never read back. When the project root
+could not accept one — a read-only mount, an immutable CI workspace — a
+plain permission_mode="plan" call failed during setup, before the coding
+agent was invoked at all.
+
+Allocate the directory only for schema-bearing runs. Their per-run
+isolation and cleanup are unchanged, so concurrent runs sharing one cwd
+still cannot overwrite or delete each other's output.
+
+Refs #684, #891 (8805c96)
+
+## [0.1.141-rc.2] - 2026-09-24
+
+
+### Added
+
+- Feat(sdk/typescript): add harness provider preflight (#1069)
+
+* feat(sdk/typescript): add harness provider preflight
+
+* fix(sdk/typescript): probe harness doctor versions via the resolved binary
+
+harnessDoctor passed the bare provider name to the version probe while
+findExecutable had already resolved a PATHEXT-qualified path. On Windows
+the bare name misses npm shims (ENOENT) and spawning a resolved .cmd/.bat
+without a shell is rejected by Node (EINVAL, CVE-2024-27980), so shim-based
+providers like codex always reported version_probe_failed and usable=false.
+
+Probe the resolved absolute path instead, and route Windows batch shims
+through cmd.exe /d /s /c with the outer-quote form so paths with spaces
+survive. POSIX behavior is unchanged: the same file that findExecutable
+verified is executed directly. The VersionProbe contract now documents
+that command[0] is the resolved path.
+
+* fix(sdk/typescript): pass options.env to harness doctor binary resolution
+
+harnessDoctor resolved binaries against process.env even when callers
+supplied HarnessDoctorOptions.env, so a report could mix installation
+state from the process environment with authentication state from the
+custom one. Binary discovery (PATH lookup and Windows PATHEXT matching)
+now uses the same env as the offline auth signal.
+
+Addresses PR #1069 review feedback. (5b0bf9b)
+
+## [0.1.141-rc.1] - 2026-09-24
+
+
+### Testing
+
+- Test(sdk/go): cover verifier constraint and request branches (#1071) (0ef73eb)
+
 ## [0.1.140] - 2026-09-21
 
 ## [0.1.140-rc.6] - 2026-09-21

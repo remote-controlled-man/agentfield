@@ -3,8 +3,13 @@ import time
 
 import httpx
 import pytest
+import requests
 
-from agentfield.agent import Agent
+from agentfield.agent import (
+    Agent,
+    _is_retryable_status_callback_error,
+    _is_transient_status_callback,
+)
 from agentfield.agent_pause import PauseClock
 from agentfield.client import AgentFieldClient, ApprovalResult
 
@@ -69,7 +74,7 @@ async def test_post_execution_status_retries(monkeypatch):
     async def fake_request(self, method, url, **kwargs):
         attempts["count"] += 1
         if attempts["count"] < 3:
-            raise RuntimeError("transient error")
+            raise httpx.ConnectError("connection refused")
         return DummyResponse(200)
 
     monkeypatch.setattr(AgentFieldClient, "_async_request", fake_request)
@@ -90,6 +95,383 @@ async def test_post_execution_status_retries(monkeypatch):
 
     assert attempts["count"] == 3
     assert sleeps == [1, 2]
+
+
+def test_is_transient_status_callback_matches_go_policy():
+    """Same contract as Go ``isTransientPollStatus``: 408, 429, and 5xx only."""
+    for code in (408, 429, 500, 502, 503, 504, 599):
+        assert _is_transient_status_callback(code), code
+    for code in (100, 204, 301, 302, 400, 401, 403, 404, 409, 418, 422, 499):
+        assert not _is_transient_status_callback(code), code
+
+
+def test_is_retryable_status_callback_error_matches_transport_failures():
+    """Do-equivalent failures retry; request-construction and bugs do not."""
+    retryable = (
+        httpx.ConnectTimeout("timed out"),
+        httpx.ReadTimeout("timed out"),
+        httpx.WriteTimeout("timed out"),
+        httpx.PoolTimeout("timed out"),
+        httpx.ConnectError("connection refused"),
+        httpx.RemoteProtocolError("malformed response"),
+        TimeoutError("timed out"),
+        ConnectionResetError("reset"),
+        requests.exceptions.Timeout("timed out"),
+        requests.exceptions.ConnectionError("connection refused"),
+        requests.exceptions.ConnectTimeout("timed out"),
+    )
+    for exc in retryable:
+        assert _is_retryable_status_callback_error(exc), type(exc)
+
+    permanent = (
+        httpx.InvalidURL("http://[::1"),
+        TypeError("bad payload"),
+        RuntimeError("bug"),
+        ValueError("bug"),
+        requests.exceptions.InvalidURL("http://[::1"),
+        requests.exceptions.MissingSchema("control-plane"),
+        asyncio.CancelledError(),
+    )
+    for exc in permanent:
+        assert not _is_retryable_status_callback_error(exc), type(exc)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [400, 401, 403, 404, 409])
+async def test_post_execution_status_does_not_retry_permanent_client_errors(
+    monkeypatch, status_code
+):
+    agent = Agent(
+        node_id="test-agent", agentfield_server="http://control", auto_register=False
+    )
+    attempts = {"count": 0}
+    timeouts = []
+
+    class DummyResponse:
+        def __init__(self, code: int):
+            self.status_code = code
+
+    async def fake_request(self, method, url, **kwargs):
+        attempts["count"] += 1
+        timeouts.append(kwargs.get("timeout"))
+        return DummyResponse(status_code)
+
+    monkeypatch.setattr(AgentFieldClient, "_async_request", fake_request)
+
+    sleeps = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    warns = []
+    errors = []
+
+    def capture_warn(message, **kwargs):
+        warns.append(message)
+
+    def capture_error(message, **kwargs):
+        errors.append(message)
+
+    monkeypatch.setattr("agentfield.agent.log_warn", capture_warn)
+    monkeypatch.setattr("agentfield.agent.log_error", capture_error)
+
+    await agent._post_execution_status(
+        "http://control/api/v1/executions/exec-1/status",
+        {"status": "succeeded"},
+        "exec-1",
+    )
+
+    assert attempts["count"] == 1
+    assert sleeps == []
+    assert timeouts == [30.0]
+    assert warns == []
+    assert len(errors) == 1
+    assert str(status_code) in errors[0]
+    assert "not retrying" in errors[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [408, 429, 502])
+async def test_post_execution_status_retries_transient_http_statuses(
+    monkeypatch, status_code
+):
+    agent = Agent(
+        node_id="test-agent", agentfield_server="http://control", auto_register=False
+    )
+    attempts = {"count": 0}
+
+    class DummyResponse:
+        def __init__(self, code: int):
+            self.status_code = code
+
+    async def fake_request(self, method, url, **kwargs):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            return DummyResponse(status_code)
+        return DummyResponse(204)
+
+    monkeypatch.setattr(AgentFieldClient, "_async_request", fake_request)
+
+    sleeps = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    await agent._post_execution_status(
+        "http://control/api/v1/executions/exec-1/status",
+        {"status": "succeeded"},
+        "exec-1",
+    )
+
+    assert attempts["count"] == 2
+    assert sleeps == [1]
+
+
+@pytest.mark.asyncio
+async def test_post_execution_status_exhausts_transient_retries(monkeypatch):
+    agent = Agent(
+        node_id="test-agent", agentfield_server="http://control", auto_register=False
+    )
+    attempts = {"count": 0}
+
+    class DummyResponse:
+        def __init__(self, code: int):
+            self.status_code = code
+
+    async def fake_request(self, method, url, **kwargs):
+        attempts["count"] += 1
+        assert kwargs.get("timeout") == 30.0
+        return DummyResponse(503)
+
+    monkeypatch.setattr(AgentFieldClient, "_async_request", fake_request)
+
+    sleeps = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    await agent._post_execution_status(
+        "http://control/api/v1/executions/exec-1/status",
+        {"status": "running"},
+        "exec-1",
+    )
+
+    assert attempts["count"] == 5
+    assert sleeps == [1, 2, 4, 8]
+
+
+@pytest.mark.asyncio
+async def test_post_execution_status_stops_after_permanent_status(monkeypatch):
+    """A later 409 must not keep the backoff going after an earlier 502."""
+    agent = Agent(
+        node_id="test-agent", agentfield_server="http://control", auto_register=False
+    )
+    codes = [502, 409]
+    attempts = {"count": 0}
+
+    class DummyResponse:
+        def __init__(self, code: int):
+            self.status_code = code
+
+    async def fake_request(self, method, url, **kwargs):
+        attempts["count"] += 1
+        return DummyResponse(codes.pop(0))
+
+    monkeypatch.setattr(AgentFieldClient, "_async_request", fake_request)
+
+    sleeps = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    await agent._post_execution_status(
+        "http://control/api/v1/executions/exec-1/status",
+        {"status": "succeeded"},
+        "exec-1",
+    )
+
+    assert attempts["count"] == 2
+    assert sleeps == [1]
+    assert codes == []
+
+
+@pytest.mark.asyncio
+async def test_post_execution_status_shutdown_still_single_attempt(monkeypatch):
+    agent = Agent(
+        node_id="test-agent", agentfield_server="http://control", auto_register=False
+    )
+    agent._shutdown_cancelling = True
+    attempts = {"count": 0}
+    timeouts = []
+
+    class DummyResponse:
+        def __init__(self, code: int):
+            self.status_code = code
+
+    async def fake_request(self, method, url, **kwargs):
+        attempts["count"] += 1
+        timeouts.append(kwargs.get("timeout"))
+        return DummyResponse(503)
+
+    monkeypatch.setattr(AgentFieldClient, "_async_request", fake_request)
+
+    sleeps = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    await agent._post_execution_status(
+        "http://control/api/v1/executions/exec-1/status",
+        {"status": "cancelled"},
+        "exec-1",
+    )
+
+    assert attempts["count"] == 1
+    assert sleeps == []
+    assert timeouts == [5.0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx.ConnectTimeout("timed out"),
+        httpx.ReadTimeout("timed out"),
+        httpx.ConnectError("connection refused"),
+        requests.exceptions.Timeout("timed out"),
+        requests.exceptions.ConnectionError("connection refused"),
+    ],
+)
+async def test_post_execution_status_retries_transport_errors(monkeypatch, exc):
+    agent = Agent(
+        node_id="test-agent", agentfield_server="http://control", auto_register=False
+    )
+    attempts = {"count": 0}
+
+    class DummyResponse:
+        def __init__(self, status_code: int):
+            self.status_code = status_code
+
+    async def fake_request(self, method, url, **kwargs):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise exc
+        return DummyResponse(204)
+
+    monkeypatch.setattr(AgentFieldClient, "_async_request", fake_request)
+
+    sleeps = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    await agent._post_execution_status(
+        "http://control/api/v1/executions/exec-1/status",
+        {"status": "running"},
+        "exec-1",
+    )
+
+    assert attempts["count"] == 2
+    assert sleeps == [1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx.InvalidURL("http://[::1"),
+        TypeError("bad payload"),
+        RuntimeError("bug"),
+        requests.exceptions.InvalidURL("http://[::1"),
+        requests.exceptions.MissingSchema("control-plane"),
+    ],
+)
+async def test_post_execution_status_does_not_retry_permanent_exceptions(
+    monkeypatch, exc
+):
+    agent = Agent(
+        node_id="test-agent", agentfield_server="http://control", auto_register=False
+    )
+    attempts = {"count": 0}
+    warns = []
+    errors = []
+
+    async def fake_request(self, method, url, **kwargs):
+        attempts["count"] += 1
+        raise exc
+
+    monkeypatch.setattr(AgentFieldClient, "_async_request", fake_request)
+
+    sleeps = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    def capture_warn(message, **kwargs):
+        warns.append(message)
+
+    def capture_error(message, **kwargs):
+        errors.append(message)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr("agentfield.agent.log_warn", capture_warn)
+    monkeypatch.setattr("agentfield.agent.log_error", capture_error)
+
+    await agent._post_execution_status(
+        "http://control/api/v1/executions/exec-1/status",
+        {"status": "succeeded"},
+        "exec-1",
+    )
+
+    assert attempts["count"] == 1
+    assert sleeps == []
+    assert warns == []
+    assert len(errors) == 1
+    assert "not retrying" in errors[0]
+
+
+@pytest.mark.asyncio
+async def test_post_execution_status_propagates_cancellation(monkeypatch):
+    """Cancellation must leave the retry loop immediately, with no backoff."""
+    agent = Agent(
+        node_id="test-agent", agentfield_server="http://control", auto_register=False
+    )
+    attempts = {"count": 0}
+
+    async def fake_request(self, method, url, **kwargs):
+        attempts["count"] += 1
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(AgentFieldClient, "_async_request", fake_request)
+
+    sleeps = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await agent._post_execution_status(
+            "http://control/api/v1/executions/exec-1/status",
+            {"status": "succeeded"},
+            "exec-1",
+        )
+
+    assert attempts["count"] == 1
+    assert sleeps == []
 
 
 @pytest.mark.asyncio
