@@ -6,6 +6,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) 
 
 <!-- changelog:entries -->
 
+## [0.1.146-rc.11] - 2026-11-01
+
+
+### Chores
+
+- Chore(deps): bump joserfc (#1143)
+
+Bumps the uv group with 1 update in the /sdk/python directory: [joserfc](https://github.com/authlib/joserfc).
+
+
+Updates `joserfc` from 1.7.1 to 1.7.6
+- [Release notes](https://github.com/authlib/joserfc/releases)
+- [Changelog](https://github.com/authlib/joserfc/blob/main/docs/changelog.rst)
+- [Commits](https://github.com/authlib/joserfc/compare/1.7.1...1.7.6)
+
+---
+updated-dependencies:
+- dependency-name: joserfc
+  dependency-version: 1.7.6
+  dependency-type: direct:production
+  dependency-group: uv
+...
+
+Signed-off-by: dependabot[bot] <support@github.com>
+Co-authored-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com> (17ffde9)
+
+
+
+### Fixed
+
+- Fix(python): stop memory event reconnects during shutdown (#1142) (2f94b3a)
+
 ## [0.1.146-rc.10] - 2026-10-31
 
 
